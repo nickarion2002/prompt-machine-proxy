@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
 
 let spotifyAccessToken = null;
 let spotifyTokenExpiresAt = 0;
@@ -129,12 +130,19 @@ app.post("/api/spotify/track-features", async (req, res) => {
     }
 
     const genres = await lookupGenresForTrack(track);
+    const artistName = (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", ");
+    const lastfmTags = await lookupLastFmTags(track.name || youtubeTitle, artistName || youtubeChannel);
     const responseBody = {
       trackId: track.id,
       trackName: track.name || "",
-      artistName: (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", "),
+      artistName,
       genres,
     };
+    if (lastfmTags.length) {
+      responseBody.lastfmTags = lastfmTags;
+      const lastfmGenre = mapSpotifyGenres(lastfmTags);
+      if (lastfmGenre && !responseBody.genre) responseBody.genre = lastfmGenre;
+    }
 
     const audioFeatures = await lookupAudioFeatures(track.id, token);
     if (audioFeatures) {
@@ -321,6 +329,37 @@ async function lookupAudioFeatures(trackId, token) {
     timeSignature: data.time_signature,
     durationMs: data.duration_ms,
   };
+}
+
+async function lookupLastFmTags(trackName, artistName) {
+  if (!LASTFM_API_KEY || !trackName || !artistName) return [];
+
+  const primaryArtist = String(artistName).split(",")[0].trim();
+  const url = new URL("https://ws.audioscrobbler.com/2.0/");
+  url.searchParams.set("method", "track.gettoptags");
+  url.searchParams.set("artist", primaryArtist);
+  url.searchParams.set("track", trackName);
+  url.searchParams.set("api_key", LASTFM_API_KEY);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("autocorrect", "1");
+
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!response.ok) {
+      console.warn(`Last.fm tags unavailable: ${response.status} ${JSON.stringify(data)}`);
+      return [];
+    }
+
+    const tags = data?.toptags?.tag || [];
+    return tags
+      .map((tag) => String(tag.name || "").trim())
+      .filter(Boolean)
+      .slice(0, 12);
+  } catch (err) {
+    console.warn(`Last.fm tags failed: ${err.message}`);
+    return [];
+  }
 }
 
 async function lookupArtistGenreById(artistId) {
