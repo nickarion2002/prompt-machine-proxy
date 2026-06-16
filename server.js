@@ -10,6 +10,7 @@ const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 
 let spotifyAccessToken = null;
 let spotifyTokenExpiresAt = 0;
+const trackFeatureCache = new Map();
 
 // ─── Model ID remapping ───────────────────────────────────────────────────────
 // OpenRouter periodically deprecates model IDs. We remap old IDs to current
@@ -101,6 +102,53 @@ app.post("/api/spotify/genre", async (req, res) => {
   }
 });
 
+app.post("/api/spotify/track-features", async (req, res) => {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    return res.status(500).json({ error: "Server misconfiguration: missing Spotify credentials." });
+  }
+
+  const youtubeTitle = String(req.body?.youtubeTitle || "").trim();
+  const youtubeChannel = String(req.body?.youtubeChannel || "").trim();
+  if (!youtubeTitle && !youtubeChannel) {
+    return res.status(400).json({ error: "Missing youtubeTitle or youtubeChannel." });
+  }
+
+  const cacheKey = normalize(`${youtubeTitle} ${youtubeChannel}`);
+  const cached = trackFeatureCache.get(cacheKey);
+  if (cached && Date.now() - cached.savedAt < 24 * 60 * 60 * 1000) {
+    return res.json(cached.value);
+  }
+
+  try {
+    const token = await getSpotifyAccessToken();
+    const track = await searchBestTrack(youtubeTitle, youtubeChannel, token);
+    if (!track?.id) {
+      const empty = { trackId: null, trackName: null, artistName: null, genres: [] };
+      trackFeatureCache.set(cacheKey, { savedAt: Date.now(), value: empty });
+      return res.json(empty);
+    }
+
+    const genres = await lookupGenresForTrack(track);
+    const responseBody = {
+      trackId: track.id,
+      trackName: track.name || "",
+      artistName: (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", "),
+      genres,
+    };
+
+    const audioFeatures = await lookupAudioFeatures(track.id, token);
+    if (audioFeatures) {
+      responseBody.audioFeatures = audioFeatures;
+    }
+
+    trackFeatureCache.set(cacheKey, { savedAt: Date.now(), value: responseBody });
+    return res.json(responseBody);
+  } catch (err) {
+    console.error("Spotify track-features error:", err);
+    return res.status(500).json({ error: "Spotify track feature lookup failed." });
+  }
+});
+
 async function getSpotifyAccessToken() {
   if (spotifyAccessToken && Date.now() < spotifyTokenExpiresAt) {
     return spotifyAccessToken;
@@ -168,6 +216,92 @@ async function lookupTrackGenre(title) {
     }
   }
   return null;
+}
+
+async function searchBestTrack(youtubeTitle, youtubeChannel, token) {
+  const cleanedTitle = cleanTrackQuery(youtubeTitle);
+  const cleanedArtist = cleanArtistName(youtubeChannel);
+  const queries = unique([
+    cleanedTitle && cleanedArtist ? `track:${cleanedTitle} artist:${cleanedArtist}` : "",
+    cleanedTitle,
+    youtubeTitle,
+  ].filter(Boolean));
+
+  const targetArtist = normalize(cleanedArtist || artistFromTitle(youtubeTitle));
+  const targetTitle = normalize(cleanedTitle);
+
+  for (const query of queries) {
+    const url = new URL("https://api.spotify.com/v1/search");
+    url.searchParams.set("q", query);
+    url.searchParams.set("type", "track");
+    url.searchParams.set("limit", "5");
+
+    const data = await spotifyGet(url, token);
+    const tracks = data?.tracks?.items || [];
+    if (!tracks.length) continue;
+
+    const exactArtist = tracks.find((track) => {
+      const artistNames = (track.artists || []).map((artist) => normalize(artist.name || ""));
+      return targetArtist && artistNames.some((name) => name === targetArtist || name.includes(targetArtist) || targetArtist.includes(name));
+    });
+    if (exactArtist) return exactArtist;
+
+    const exactTitle = tracks.find((track) => targetTitle && normalize(track.name || "") === targetTitle);
+    if (exactTitle) return exactTitle;
+
+    return tracks[0];
+  }
+
+  return null;
+}
+
+async function lookupGenresForTrack(track) {
+  const genres = [];
+  for (const artist of track.artists || []) {
+    if (!artist.id) continue;
+    try {
+      const token = await getSpotifyAccessToken();
+      const data = await spotifyGet(`https://api.spotify.com/v1/artists/${artist.id}`, token);
+      for (const genre of data?.genres || []) {
+        if (genre && !genres.includes(genre)) genres.push(genre);
+      }
+    } catch (err) {
+      console.warn(`Spotify artist genre skipped for ${artist.id}: ${err.message}`);
+    }
+  }
+  return genres;
+}
+
+async function lookupAudioFeatures(trackId, token) {
+  const response = await fetch(`https://api.spotify.com/v1/audio-features/${trackId}`, {
+    headers: { "Authorization": `Bearer ${token}` },
+  });
+
+  if (response.status === 401 || response.status === 403) {
+    console.warn(`Spotify audio-features unavailable: ${response.status}`);
+    return null;
+  }
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Spotify audio-features failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+
+  return {
+    tempo: data.tempo,
+    energy: data.energy,
+    valence: data.valence,
+    danceability: data.danceability,
+    acousticness: data.acousticness,
+    instrumentalness: data.instrumentalness,
+    liveness: data.liveness,
+    loudness: data.loudness,
+    speechiness: data.speechiness,
+    key: data.key,
+    mode: data.mode,
+    timeSignature: data.time_signature,
+    durationMs: data.duration_ms,
+  };
 }
 
 async function lookupArtistGenreById(artistId) {
