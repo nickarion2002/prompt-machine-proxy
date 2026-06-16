@@ -142,7 +142,10 @@ async function lookupArtistGenre(artistName) {
       return name.includes(target) || target.includes(name);
     });
 
-  return mapSpotifyGenres(best?.genres || []);
+  const genre = mapSpotifyGenres(best?.genres || []);
+  if (genre) return genre;
+  if (best?.id) return lookupArtistGenreById(best.id);
+  return null;
 }
 
 async function lookupTrackGenre(title) {
