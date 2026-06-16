@@ -219,16 +219,20 @@ async function lookupTrackGenre(title) {
 }
 
 async function searchBestTrack(youtubeTitle, youtubeChannel, token) {
-  const cleanedTitle = cleanTrackQuery(youtubeTitle);
   const cleanedArtist = cleanArtistName(youtubeChannel);
+  const titleArtist = artistFromTitle(youtubeTitle);
+  const cleanedTitle = cleanTrackQuery(youtubeTitle, cleanedArtist || titleArtist);
   const queries = unique([
+    cleanedTitle && cleanedArtist ? `${cleanedTitle} ${cleanedArtist}` : "",
     cleanedTitle && cleanedArtist ? `track:${cleanedTitle} artist:${cleanedArtist}` : "",
     cleanedTitle,
     youtubeTitle,
   ].filter(Boolean));
 
-  const targetArtist = normalize(cleanedArtist || artistFromTitle(youtubeTitle));
+  const targetArtist = normalize(cleanedArtist || titleArtist);
   const targetTitle = normalize(cleanedTitle);
+  let bestTrack = null;
+  let bestScore = -1;
 
   for (const query of queries) {
     const url = new URL("https://api.spotify.com/v1/search");
@@ -240,19 +244,34 @@ async function searchBestTrack(youtubeTitle, youtubeChannel, token) {
     const tracks = data?.tracks?.items || [];
     if (!tracks.length) continue;
 
-    const exactArtist = tracks.find((track) => {
-      const artistNames = (track.artists || []).map((artist) => normalize(artist.name || ""));
-      return targetArtist && artistNames.some((name) => name === targetArtist || name.includes(targetArtist) || targetArtist.includes(name));
-    });
-    if (exactArtist) return exactArtist;
+    for (const track of tracks) {
+      const score = scoreTrackMatch(track, targetTitle, targetArtist);
+      if (score > bestScore) {
+        bestTrack = track;
+        bestScore = score;
+      }
+    }
 
-    const exactTitle = tracks.find((track) => targetTitle && normalize(track.name || "") === targetTitle);
-    if (exactTitle) return exactTitle;
-
-    return tracks[0];
+    if (bestScore >= 80) return bestTrack;
   }
 
-  return null;
+  return bestTrack;
+}
+
+function scoreTrackMatch(track, targetTitle, targetArtist) {
+  let score = 0;
+  const trackTitle = normalize(track.name || "");
+  if (targetTitle && trackTitle === targetTitle) score += 60;
+  else if (targetTitle && (trackTitle.includes(targetTitle) || targetTitle.includes(trackTitle))) score += 40;
+
+  if (targetArtist) {
+      const artistNames = (track.artists || []).map((artist) => normalize(artist.name || ""));
+    if (artistNames.some((name) => name === targetArtist)) score += 60;
+    else if (artistNames.some((name) => name.includes(targetArtist) || targetArtist.includes(name))) score += 35;
+    else score -= 25;
+  }
+
+  return score;
 }
 
 async function lookupGenresForTrack(track) {
@@ -364,10 +383,23 @@ function artistFromTitle(title) {
   return index >= 0 ? title.slice(0, index).trim() : "";
 }
 
-function cleanTrackQuery(title) {
-  return title
-    .replace(/\(official video\)|\[official video\]|\(official music video\)|\(lyrics\)|\[lyrics\]|\(visualizer\)|\(audio\)/gi, "")
+function cleanTrackQuery(title, artistName = "") {
+  let cleaned = String(title || "")
+    .replace(/\(official video\)|\[official video\]|\(official music video\)|official video|official music video|\(lyrics\)|\[lyrics\]|lyrics|\(visualizer\)|visualizer|\(audio\)|audio/gi, "")
+    .replace(/\s+/g, " ")
     .trim();
+
+  const dashArtist = artistFromTitle(cleaned);
+  if (dashArtist) {
+    cleaned = cleaned.slice(cleaned.indexOf(" - ") + 3).trim();
+  }
+
+  const normalizedArtist = normalize(artistName || dashArtist);
+  if (normalizedArtist && normalize(cleaned).startsWith(normalizedArtist)) {
+    cleaned = cleaned.slice(String(artistName || dashArtist).length).trim();
+  }
+
+  return cleaned.replace(/^[-–:|]+|[-–:|]+$/g, "").trim();
 }
 
 function normalize(text) {
