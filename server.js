@@ -13,6 +13,63 @@ let spotifyAccessToken = null;
 let spotifyTokenExpiresAt = 0;
 const trackFeatureCache = new Map();
 
+// ─── App key check ────────────────────────────────────────────────────────────
+// The iOS app sends X-App-Key with every request. Enforcement is opt-in via
+// ENFORCE_APP_KEY=true so that already-shipped app versions (which don't send
+// the header yet) keep working until the update is rolled out.
+const APP_SHARED_SECRET = process.env.APP_SHARED_SECRET;
+const ENFORCE_APP_KEY = process.env.ENFORCE_APP_KEY === "true";
+
+function checkAppKey(req, res, next) {
+  if (!APP_SHARED_SECRET) return next();
+  const ok = req.get("X-App-Key") === APP_SHARED_SECRET;
+  if (!ok) {
+    console.warn(`[auth] Missing/bad X-App-Key on ${req.path} from ${clientIp(req)}`);
+    if (ENFORCE_APP_KEY) {
+      return res.status(401).json({ error: "Unauthorized." });
+    }
+  }
+  next();
+}
+
+// ─── Per-IP rate limiting ─────────────────────────────────────────────────────
+// Protects the OpenRouter/Spotify credits from abuse. Default: 60 requests
+// per hour per IP (a real user generates far less).
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "60", 10);
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+const ipHits = new Map();
+
+function clientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  return (typeof fwd === "string" && fwd.split(",")[0].trim()) || req.ip;
+}
+
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = clientIp(req);
+  let entry = ipHits.get(ip);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry = { windowStart: now, count: 0 };
+  }
+  entry.count += 1;
+  ipHits.set(ip, entry);
+
+  // Keep the map from growing forever.
+  if (ipHits.size > 10000) {
+    for (const [key, value] of ipHits) {
+      if (now - value.windowStart > RATE_LIMIT_WINDOW_MS) ipHits.delete(key);
+    }
+  }
+
+  if (entry.count > RATE_LIMIT_MAX) {
+    console.warn(`[rate-limit] ${ip} exceeded ${RATE_LIMIT_MAX} req/h on ${req.path}`);
+    return res.status(429).json({ error: "Too many requests. Try again later." });
+  }
+  next();
+}
+
+app.use(["/api/generate", "/api/spotify/genre", "/api/spotify/track-features"], rateLimit, checkAppKey);
+
 // ─── Model ID remapping ───────────────────────────────────────────────────────
 // OpenRouter periodically deprecates model IDs. We remap old IDs to current
 // valid ones so the iOS app keeps working without forcing every user to update.
