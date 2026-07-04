@@ -74,10 +74,15 @@ app.use(["/api/generate", "/api/spotify/genre", "/api/spotify/track-features"], 
 // OpenRouter periodically deprecates model IDs. We remap old IDs to current
 // valid ones so the iOS app keeps working without forcing every user to update.
 const MODEL_REMAP = {
-  "google/gemini-flash-1.5":      "google/gemini-2.5-flash",
-  "google/gemini-1.5-flash":      "google/gemini-2.5-flash",
+  // Old Gemini IDs → Gemini 3.1 Flash Lite (newer, cheaper, better)
+  "google/gemini-flash-1.5":      "google/gemini-3.1-flash-lite",
+  "google/gemini-1.5-flash":      "google/gemini-3.1-flash-lite",
+  "google/gemini-2.0-flash-001":  "google/gemini-3.1-flash-lite",
+  "google/gemini-2.5-flash":      "google/gemini-3.1-flash-lite",
+  // Old DeepSeek IDs → DeepSeek V4 Flash (2-3x cheaper, better quality)
+  "deepseek/deepseek-chat":       "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-chat-v3.1":  "deepseek/deepseek-v4-flash",
   "mistralai/mistral-small-3.1":  "mistralai/mistral-small-3.2-24b-instruct-2506",
-  "deepseek/deepseek-chat":       "deepseek/deepseek-chat-v3.1",
 };
 
 function remapModel(modelId) {
