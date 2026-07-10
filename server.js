@@ -82,6 +82,9 @@ const MODEL_REMAP = {
   // Old DeepSeek IDs → DeepSeek V4 Flash (2-3x cheaper, better quality)
   "deepseek/deepseek-chat":       "deepseek/deepseek-v4-flash",
   "deepseek/deepseek-chat-v3.1":  "deepseek/deepseek-v4-flash",
+  // Sonnet 4.6 → Sonnet 5 (newer generation, better AND cheaper: $2/$10 vs
+  // $3/$15). Upgrades all PRO users server-side. Revert = delete this line.
+  "anthropic/claude-sonnet-4.6":  "anthropic/claude-sonnet-5",
   "mistralai/mistral-small-3.1":  "mistralai/mistral-small-3.2-24b-instruct-2506",
 };
 
