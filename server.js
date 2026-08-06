@@ -524,6 +524,37 @@ function unique(values) {
   });
 }
 
+// Privacy Policy page — linked from the app's paywall (App Review 3.1.2(c)
+// requires a FUNCTIONAL privacy policy link inside the app).
+app.get("/privacy", (req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Maschine — Privacy Policy</title>
+<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}h1{font-size:1.6em}h2{font-size:1.15em;margin-top:1.6em}</style>
+</head><body>
+<h1>Prompt Maschine — Privacy Policy</h1>
+<p><em>Last updated: August 6, 2026</em></p>
+<p>Prompt Maschine ("the app") is developed by Traian Arion. This policy explains what data the app handles and how.</p>
+<h2>What we collect</h2>
+<p><b>Account data.</b> If you sign in (Apple or Google), we receive your name and email address, used only to identify your account. You may also use the app as a guest.</p>
+<p><b>Usage analytics.</b> We collect anonymous usage data via Firebase Analytics (screens viewed, feature usage, subscription tier, device identifier for analytics). This data is not linked to your identity and is used solely to improve the app.</p>
+<p><b>Content you submit.</b> Song ideas, YouTube links or audio you analyze are sent to our server and to AI providers strictly to generate your prompts and lyrics. They are processed transiently and are not used to train models by us, sold, or shared for advertising.</p>
+<h2>What we do NOT do</h2>
+<p>We do not sell your data. We do not show ads. We do not share personal data with third parties except the processors needed to run the service (Apple, Google/Firebase, our hosting provider Render, and AI model providers via OpenRouter).</p>
+<h2>Subscriptions</h2>
+<p>Payments are processed entirely by Apple through your Apple ID. We never see your payment details. Manage or cancel anytime in Settings → Apple ID → Subscriptions.</p>
+<h2>Data retention & deletion</h2>
+<p>Saved prompts and lyrics are stored locally on your device. Account data is retained while your account exists. To delete your account and associated data, use "Delete Account" in the app's Settings or contact us.</p>
+<h2>Children</h2>
+<p>The app is rated 4+ and does not knowingly collect personal data from children.</p>
+<h2>Contact</h2>
+<p>Questions or data requests: <a href="mailto:nickarion2002@yahoo.com">nickarion2002@yahoo.com</a></p>
+<h2>Terms of Use</h2>
+<p>The app uses Apple's standard <a href="https://www.apple.com/legal/internet-services/itunes/dev/stdeula/">Terms of Use (EULA)</a>.</p>
+</body></html>`);
+});
+
 app.listen(PORT, () => {
   console.log(`Proxy running on port ${PORT}`);
 });
