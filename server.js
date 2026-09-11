@@ -96,6 +96,59 @@ function remapModel(modelId) {
   return MODEL_REMAP[modelId] || modelId;
 }
 
+// ─── Anthropic prompt caching ─────────────────────────────────────────────────
+// The app sends huge, mostly-static instruction blocks on every call (~13k
+// tokens/request on average). Anthropic bills cached input at 10% of the base
+// price (cache write = 1.25x, 5-minute TTL refreshed on every hit), so marking
+// the static prefix with a cache_control breakpoint makes repeated calls within
+// a session much cheaper. Only applied to anthropic/* models; other providers
+// receive the body untouched. Content arrays (multimodal) are left as-is.
+//
+// Strategy per message:
+//  - system messages: cache the whole block (static per app version).
+//  - user messages: the lyrics builder appends its dynamic tail after a fixed
+//    "STYLE DNA" separator — split there so the big static prefix caches and
+//    the per-song tail stays uncached. Other long user messages are cached as
+//    a whole (a miss costs +25% on that message only, a hit saves 90%).
+// Anthropic ignores breakpoints on content shorter than its minimum (1024
+// tokens Sonnet/Opus, 2048 Haiku) — harmless, so we only skip tiny strings.
+const CACHE_MIN_CHARS = 3000;
+const LYRICS_TAIL_MARKER = "\n---\n\nSTYLE DNA";
+
+function cacheBlock(text) {
+  return { type: "text", text, cache_control: { type: "ephemeral" } };
+}
+
+function addAnthropicCacheControl(body) {
+  if (!body || typeof body.model !== "string" || !body.model.startsWith("anthropic/")) return body;
+  if (!Array.isArray(body.messages)) return body;
+
+  let breakpoints = 0; // Anthropic allows max 4 per request
+  const messages = body.messages.map((msg) => {
+    if (breakpoints >= 3 || !msg || typeof msg.content !== "string") return msg;
+    const text = msg.content;
+    if (text.length < CACHE_MIN_CHARS) return msg;
+
+    if (msg.role === "system") {
+      breakpoints += 1;
+      return { ...msg, content: [cacheBlock(text)] };
+    }
+
+    if (msg.role === "user") {
+      const idx = text.indexOf(LYRICS_TAIL_MARKER);
+      breakpoints += 1;
+      if (idx > CACHE_MIN_CHARS) {
+        // Static rules prefix (cached) + dynamic per-song tail (uncached)
+        return { ...msg, content: [cacheBlock(text.slice(0, idx)), { type: "text", text: text.slice(idx) }] };
+      }
+      return { ...msg, content: [cacheBlock(text)] };
+    }
+    return msg;
+  });
+
+  return { ...body, messages };
+}
+
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "Prompt Maschine proxy is running." });
@@ -117,6 +170,9 @@ app.post("/api/generate", async (req, res) => {
     }
   }
 
+  // Prompt caching for Anthropic models (see addAnthropicCacheControl)
+  const outboundBody = addAnthropicCacheControl(remappedBody);
+
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -124,13 +180,21 @@ app.post("/api/generate", async (req, res) => {
         "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(remappedBody),
+      body: JSON.stringify(outboundBody),
     });
 
     const data = await response.json();
 
     if (!response.ok) {
       return res.status(response.status).json(data);
+    }
+
+    // Cache telemetry (visible in Render logs): how much of the prompt hit cache
+    const u = data?.usage;
+    if (u?.prompt_tokens_details) {
+      const cached = u.prompt_tokens_details.cached_tokens || 0;
+      const written = u.prompt_tokens_details.cache_write_tokens || 0;
+      console.log(`[cache] ${outboundBody.model} prompt=${u.prompt_tokens} cached=${cached} written=${written} cost=${u.cost ?? "?"}`);
     }
 
     return res.json(data);
