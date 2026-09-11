@@ -85,6 +85,10 @@ const MODEL_REMAP = {
   // Sonnet 4.6 → Sonnet 5 (newer generation, better AND cheaper: $2/$10 vs
   // $3/$15). Upgrades all PRO users server-side. Revert = delete this line.
   "anthropic/claude-sonnet-4.6":  "anthropic/claude-sonnet-5",
+  // Opus 4.8 → Sonnet 5 (cost control, 10 sept 2026: $5/$25 → $2/$10, ~60%
+  // cheaper per PRO lyrics generation; Sonnet 5 quality validated in prod
+  // since July via the 4.6 remap). Revert = delete this line.
+  "anthropic/claude-opus-4.8":    "anthropic/claude-sonnet-5",
   "mistralai/mistral-small-3.1":  "mistralai/mistral-small-3.2-24b-instruct-2506",
 };
 
