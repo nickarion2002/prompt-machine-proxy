@@ -82,9 +82,7 @@ const MODEL_REMAP = {
   // Old DeepSeek IDs → DeepSeek V4 Flash (2-3x cheaper, better quality)
   "deepseek/deepseek-chat":       "deepseek/deepseek-v4-flash",
   "deepseek/deepseek-chat-v3.1":  "deepseek/deepseek-v4-flash",
-  // Sonnet 4.6 → Sonnet 5 (newer generation, better AND cheaper: $2/$10 vs
-  // $3/$15). Upgrades all PRO users server-side. Revert = delete this line.
-  "anthropic/claude-sonnet-4.6":  "anthropic/claude-sonnet-5",
+  // Keep Sonnet 4.6 distinct: shipped PRO clients use it after Opus 4.8 fails.
   // Opus 4.8 → Sonnet 5 (cost control, 10 sept 2026: $5/$25 → $2/$10, ~60%
   // cheaper per PRO lyrics generation; Sonnet 5 quality validated in prod
   // since July via the 4.6 remap). Revert = delete this line.
@@ -95,6 +93,27 @@ const MODEL_REMAP = {
 function remapModel(modelId) {
   return MODEL_REMAP[modelId] || modelId;
 }
+
+// Mobile callers wait 60–75s and expect one complete JSON response. Sonnet 5
+// enables high-effort thinking by default; in production this spent >180s on
+// reasoning while the phone retried. Retain the model but disable extended
+// thinking for this synchronous endpoint and leave room for both song variants.
+function prepareGenerationBody(body) {
+  const prepared = { ...body, model: remapModel(body.model), stream: false };
+  if (["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6"].includes(prepared.model)) {
+    delete prepared.reasoning_effort;
+    delete prepared.include_reasoning;
+    delete prepared.max_completion_tokens;
+    prepared.reasoning = { enabled: false };
+    const requestedLimit = body.max_completion_tokens ?? body.max_tokens;
+    prepared.max_tokens = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 8192)
+      : 8192;
+  }
+  return addAnthropicCacheControl(prepared);
+}
+
+const GENERATION_TIMEOUT_MS = 50_000;
 
 // ─── Anthropic prompt caching ─────────────────────────────────────────────────
 // The app sends huge, mostly-static instruction blocks on every call (~13k
@@ -151,7 +170,10 @@ function addAnthropicCacheControl(body) {
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "Prompt Maschine proxy is running." });
+  res.json({
+    status: "Prompt Maschine proxy is running.",
+    revision: process.env.RENDER_GIT_COMMIT || "local",
+  });
 });
 
 // Proxy endpoint - iOS app calls this instead of OpenRouter directly
@@ -160,18 +182,26 @@ app.post("/api/generate", async (req, res) => {
     return res.status(500).json({ error: "Server misconfiguration: missing API key." });
   }
 
-  // Remap deprecated model IDs to current valid ones
-  const remappedBody = { ...req.body };
-  if (remappedBody.model) {
-    const remapped = remapModel(remappedBody.model);
-    if (remapped !== remappedBody.model) {
-      console.log(`[generate] Remapped ${remappedBody.model} -> ${remapped}`);
-      remappedBody.model = remapped;
-    }
+  if (typeof req.body?.model !== "string" || !req.body.model.trim()
+      || !Array.isArray(req.body.messages) || req.body.messages.length === 0) {
+    return res.status(400).json({ error: "A model and non-empty messages array are required." });
   }
 
-  // Prompt caching for Anthropic models (see addAnthropicCacheControl)
-  const outboundBody = addAnthropicCacheControl(remappedBody);
+  const outboundBody = prepareGenerationBody(req.body);
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  let timedOut = false;
+  // res.close fires when the caller disconnects, including after the request
+  // body has been received. req.close would also fire on normal body completion.
+  const onDisconnect = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.on("close", onDisconnect);
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, GENERATION_TIMEOUT_MS);
+  console.log(`[generate] start requested=${req.body.model} model=${outboundBody.model}`);
 
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -181,12 +211,23 @@ app.post("/api/generate", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(outboundBody),
+      signal: controller.signal,
     });
 
     const data = await response.json();
+    if (controller.signal.aborted) throw new Error("Generation aborted");
 
     if (!response.ok) {
+      console.warn(`[generate] upstream_error model=${outboundBody.model} status=${response.status} elapsed_ms=${Date.now() - startedAt}`);
       return res.status(response.status).json(data);
+    }
+
+    // OpenRouter can return an error payload after HTTP headers are sent.
+    // Never pass an empty/truncated response to the app as a successful song.
+    const choice = data?.choices?.[0];
+    if (data?.error || !choice?.message?.content || choice.finish_reason === "length") {
+      console.warn(`[generate] incomplete model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`);
+      return res.status(502).json({ error: "AI returned an incomplete response. Please try again." });
     }
 
     // Cache telemetry (visible in Render logs): how much of the prompt hit cache
@@ -197,10 +238,20 @@ app.post("/api/generate", async (req, res) => {
       console.log(`[cache] ${outboundBody.model} prompt=${u.prompt_tokens} cached=${cached} written=${written} cost=${u.cost ?? "?"}`);
     }
 
+    console.log(`[generate] complete model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt} reasoning_tokens=${u?.completion_tokens_details?.reasoning_tokens ?? 0}`);
     return res.json(data);
   } catch (err) {
-    console.error("Proxy error:", err);
+    if (controller.signal.aborted) {
+      console.warn(`[generate] ${timedOut ? "timeout" : "client_disconnected"} model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`);
+      if (res.destroyed || res.writableEnded) return;
+      return res.status(504).json({ error: "AI generation timed out. Please try again." });
+    }
+    console.error(`[generate] proxy_error model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`, err.message);
+    if (res.destroyed || res.writableEnded) return;
     return res.status(500).json({ error: "Proxy request failed." });
+  } finally {
+    clearTimeout(timeout);
+    res.off("close", onDisconnect);
   }
 });
 
@@ -623,6 +674,10 @@ app.get("/privacy", (req, res) => {
 </body></html>`);
 });
 
-app.listen(PORT, () => {
-  console.log(`Proxy running on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Proxy running on port ${PORT}`);
+  });
+}
+
+module.exports = { app, prepareGenerationBody, GENERATION_TIMEOUT_MS };
