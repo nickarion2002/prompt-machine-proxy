@@ -1,4 +1,5 @@
 const express = require("express");
+const { createHmac, randomBytes, randomUUID } = require("node:crypto");
 const app = express();
 
 app.use(express.json());
@@ -94,7 +95,7 @@ function remapModel(modelId) {
   return MODEL_REMAP[modelId] || modelId;
 }
 
-// Mobile callers wait 60–75s and expect one complete JSON response. Sonnet 5
+// Mobile callers have 60–75s idle timeouts and expect one complete JSON response. Sonnet 5
 // enables high-effort thinking by default; in production this spent >180s on
 // reasoning while the phone retried. Retain the model but disable extended
 // thinking for this synchronous endpoint and leave room for both song variants.
@@ -109,11 +110,69 @@ function prepareGenerationBody(body) {
     prepared.max_tokens = Number.isInteger(requestedLimit) && requestedLimit > 0
       ? Math.min(requestedLimit, 8192)
       : 8192;
+    // Prefer throughput without opting into a more expensive service tier.
+    // Preserve client privacy/provider restrictions and any tighter price caps.
+    const provider = body.provider || {};
+    const prices = prepared.model === "anthropic/claude-sonnet-5"
+      ? { prompt: 2, completion: 10 } : { prompt: 3, completion: 15 };
+    const maxPrice = { ...provider.max_price };
+    for (const [kind, cap] of Object.entries(prices)) {
+      const requested = Number(maxPrice[kind]);
+      maxPrice[kind] = Number.isFinite(requested) && requested >= 0
+        ? Math.min(requested, cap) : cap;
+    }
+    prepared.provider = { ...provider, sort: provider.sort || "throughput", max_price: maxPrice };
   }
   return addAnthropicCacheControl(prepared);
 }
 
-const GENERATION_TIMEOUT_MS = 50_000;
+// A large Romanian/Humanizer request was still producing useful output at 50s.
+// Keep the connection alive below the shipped clients' idle timeouts while
+// allowing a bounded 120s for a complete result. This is NOT an overall app SLA.
+const GENERATION_TIMEOUT_MS = 120_000;
+const GENERATION_HEARTBEAT_MS = 10_000;
+const RETRY_COOLDOWN_MS = 60_000;
+const failedGenerations = new Map();
+const fingerprintSecret = randomBytes(32);
+
+function canonicalJSON(value) {
+  if (Array.isArray(value)) return value.map(canonicalJSON);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalJSON(value[key])]));
+  }
+  return value;
+}
+
+function generationFingerprint(req) {
+  // The shipped app re-encodes JSON and changes only model on fallback. Ignore
+  // model and canonicalize key order so a timeout cannot cause six paid copies.
+  // Store only a per-process HMAC, scoped to the caller; never store song text.
+  const { model, ...request } = req.body;
+  const scoped = [clientIp(req), req.get("X-App-Key") || "", req.get("Authorization") || "", request];
+  return createHmac("sha256", fingerprintSecret).update(JSON.stringify(canonicalJSON(scoped))).digest("hex");
+}
+
+function blockImmediateRetry(key) {
+  const now = Date.now();
+  for (const [entry, expires] of failedGenerations) {
+    if (expires <= now) failedGenerations.delete(entry);
+  }
+  if (failedGenerations.size >= 1000) failedGenerations.delete(failedGenerations.keys().next().value);
+  failedGenerations.set(key, now + RETRY_COOLDOWN_MS);
+}
+
+function sendGenerationJSON(res, status, body) {
+  if (res.destroyed || res.writableEnded) return;
+  // After heartbeat bytes, HTTP status is already 200. Include an explicit
+  // error/code in failures; never fabricate choices or return partial lyrics.
+  // JSONDecoder/response.json accept leading JSON whitespace without changes.
+  if (res.headersSent) {
+    const payload = status >= 400 ? { error: body?.error || "AI provider request failed.",
+      code: body?.code || "generation_failed", status, retry_after: body?.retry_after } : body;
+    return res.end(JSON.stringify(payload));
+  }
+  return res.status(status).json(body);
+}
 
 // ─── Anthropic prompt caching ─────────────────────────────────────────────────
 // The app sends huge, mostly-static instruction blocks on every call (~13k
@@ -187,21 +246,47 @@ app.post("/api/generate", async (req, res) => {
     return res.status(400).json({ error: "A model and non-empty messages array are required." });
   }
 
+  const fingerprint = generationFingerprint(req);
+  const retryUntil = failedGenerations.get(fingerprint) || 0;
+  if (retryUntil > Date.now()) {
+    const retryAfter = Math.ceil((retryUntil - Date.now()) / 1000);
+    res.set("Retry-After", String(retryAfter));
+    return res.status(429).json({ error: "The previous identical generation did not finish. Please wait before retrying.",
+      code: "generation_retry_cooldown", retry_after: retryAfter });
+  }
+  failedGenerations.delete(fingerprint);
+
   const outboundBody = prepareGenerationBody(req.body);
+  const requestId = randomUUID();
+  res.set("X-Generation-Request-Id", requestId);
   const startedAt = Date.now();
   const controller = new AbortController();
   let timedOut = false;
   // res.close fires when the caller disconnects, including after the request
   // body has been received. req.close would also fire on normal body completion.
   const onDisconnect = () => {
-    if (!res.writableEnded) controller.abort();
+    if (!res.writableEnded) {
+      blockImmediateRetry(fingerprint);
+      controller.abort();
+    }
   };
   res.on("close", onDisconnect);
   const timeout = setTimeout(() => {
     timedOut = true;
+    blockImmediateRetry(fingerprint);
     controller.abort();
   }, GENERATION_TIMEOUT_MS);
-  console.log(`[generate] start requested=${req.body.model} model=${outboundBody.model}`);
+  const heartbeat = setInterval(() => {
+    if (controller.signal.aborted || res.destroyed || res.writableEnded) return;
+    if (!res.headersSent) {
+      res.status(200).set({ "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no" });
+    }
+    // Whitespace is valid before a JSON object. A 1KB chunk also avoids tiny
+    // writes being coalesced by intermediaries. This is not SSE or partial JSON.
+    res.write(" ".repeat(1023) + "\n");
+  }, GENERATION_HEARTBEAT_MS);
+  console.log(`[generate] start id=${requestId} requested=${req.body.model} model=${outboundBody.model}`);
 
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -219,7 +304,7 @@ app.post("/api/generate", async (req, res) => {
 
     if (!response.ok) {
       console.warn(`[generate] upstream_error model=${outboundBody.model} status=${response.status} elapsed_ms=${Date.now() - startedAt}`);
-      return res.status(response.status).json(data);
+      return sendGenerationJSON(res, response.status, data);
     }
 
     // OpenRouter can return an error payload after HTTP headers are sent.
@@ -227,7 +312,7 @@ app.post("/api/generate", async (req, res) => {
     const choice = data?.choices?.[0];
     if (data?.error || !choice?.message?.content || choice.finish_reason === "length") {
       console.warn(`[generate] incomplete model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`);
-      return res.status(502).json({ error: "AI returned an incomplete response. Please try again." });
+      return sendGenerationJSON(res, 502, { error: "AI returned an incomplete response. Please try again.", code: "generation_incomplete" });
     }
 
     // Cache telemetry (visible in Render logs): how much of the prompt hit cache
@@ -238,19 +323,20 @@ app.post("/api/generate", async (req, res) => {
       console.log(`[cache] ${outboundBody.model} prompt=${u.prompt_tokens} cached=${cached} written=${written} cost=${u.cost ?? "?"}`);
     }
 
-    console.log(`[generate] complete model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt} reasoning_tokens=${u?.completion_tokens_details?.reasoning_tokens ?? 0}`);
-    return res.json(data);
+    console.log(`[generate] complete id=${requestId} model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt} reasoning_tokens=${u?.completion_tokens_details?.reasoning_tokens ?? 0}`);
+    return sendGenerationJSON(res, 200, data);
   } catch (err) {
     if (controller.signal.aborted) {
-      console.warn(`[generate] ${timedOut ? "timeout" : "client_disconnected"} model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`);
+      console.warn(`[generate] ${timedOut ? "timeout" : "client_disconnected"} id=${requestId} model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`);
       if (res.destroyed || res.writableEnded) return;
-      return res.status(504).json({ error: "AI generation timed out. Please try again." });
+      return sendGenerationJSON(res, 504, { error: "AI generation timed out. Please wait one minute before trying again.", code: "generation_timeout", retry_after: 60 });
     }
     console.error(`[generate] proxy_error model=${outboundBody.model} elapsed_ms=${Date.now() - startedAt}`, err.message);
     if (res.destroyed || res.writableEnded) return;
-    return res.status(500).json({ error: "Proxy request failed." });
+    return sendGenerationJSON(res, 500, { error: "Proxy request failed.", code: "generation_proxy_error" });
   } finally {
     clearTimeout(timeout);
+    clearInterval(heartbeat);
     res.off("close", onDisconnect);
   }
 });
@@ -680,4 +766,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, prepareGenerationBody, GENERATION_TIMEOUT_MS };
+module.exports = { app, prepareGenerationBody, GENERATION_TIMEOUT_MS, GENERATION_HEARTBEAT_MS };

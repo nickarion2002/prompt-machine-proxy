@@ -6,9 +6,10 @@ const http = require("node:http");
 process.env.OPENROUTER_API_KEY = "unit-test-only";
 process.env.APP_SHARED_SECRET = "unit-test-app-key";
 process.env.ENFORCE_APP_KEY = "true";
-const { app, prepareGenerationBody, GENERATION_TIMEOUT_MS } = require("../server");
+const { app, prepareGenerationBody, GENERATION_TIMEOUT_MS, GENERATION_HEARTBEAT_MS } = require("../server");
 const clientFetch = global.fetch;
 const originalSetTimeout = global.setTimeout;
+const originalSetInterval = global.setInterval;
 const messages = [{ role: "user", content: "Write original Romanian lyrics." }];
 const song = { choices: [{ finish_reason: "stop", message: { content: '{"lyrics":"test"}' } }] };
 let server;
@@ -56,6 +57,17 @@ test("output budget respects smaller limits and normalizes the alternate token p
   const alternate = make({ max_tokens: 9000, max_completion_tokens: 1000 });
   assert.equal(alternate.max_tokens, 1000);
   assert.equal(alternate.max_completion_tokens, undefined);
+});
+
+test("throughput routing never opts into higher prices or discards client restrictions", () => {
+  const primary = prepareGenerationBody({ model: "anthropic/claude-opus-4.8", messages });
+  assert.equal(primary.provider.sort, "throughput");
+  assert.deepEqual(primary.provider.max_price, { prompt: 2, completion: 10 });
+  const restricted = { sort: "latency", only: ["anthropic"], zdr: true, data_collection: "deny",
+    max_price: { prompt: 1, completion: 100, request: 0.01 } };
+  const fallback = prepareGenerationBody({ model: "anthropic/claude-sonnet-4.6", messages, provider: restricted });
+  assert.deepEqual(fallback.provider, { ...restricted, max_price: { prompt: 1, completion: 15, request: 0.01 } });
+  assert.equal(restricted.max_price.completion, 100, "do not mutate caller constraints");
 });
 
 test("preserve non-Sonnet model settings and existing prompt cache breakpoints", () => {
@@ -148,7 +160,7 @@ test("client disconnect cancels the provider even after the request body is full
     method: "POST", headers: { "Content-Type": "application/json", "X-App-Key": "unit-test-app-key" },
   });
   request.on("error", () => {});
-  request.end(JSON.stringify({ model: "anthropic/claude-opus-4.8", messages }));
+  request.end(JSON.stringify({ model: "anthropic/claude-opus-4.8", messages: [{ role: "user", content: "disconnect test" }] }));
   let timer;
   try {
     await Promise.race([aborted, new Promise((resolve, reject) => {
@@ -158,4 +170,79 @@ test("client disconnect cancels the provider even after the request body is full
     clearTimeout(timer);
     request.destroy();
   }
+});
+
+test("heartbeat keeps one valid JSON response alive beyond the old 50-second cutoff", async t => {
+  assert.equal(GENERATION_TIMEOUT_MS, 120000);
+  assert.equal(GENERATION_HEARTBEAT_MS, 10000);
+  t.mock.method(global, "setInterval", (fn, delay, ...args) =>
+    originalSetInterval(fn, delay === GENERATION_HEARTBEAT_MS ? 10 : delay, ...args));
+  t.mock.method(global, "setTimeout", (fn, delay, ...args) =>
+    originalSetTimeout(fn, delay === GENERATION_TIMEOUT_MS ? 120 : delay, ...args));
+  t.mock.method(global, "fetch", async () => {
+    await new Promise(resolve => originalSetTimeout(resolve, 80));
+    return Response.json(song);
+  });
+  const response = await post({ model: "anthropic/claude-opus-4.8",
+    messages: [{ role: "user", content: "slow complete response" }] });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /application\/json/);
+  assert.equal(response.headers.get("cache-control"), "no-store, no-transform");
+  assert.ok(response.headers.get("x-generation-request-id"));
+  const text = await response.text();
+  assert.match(text, /^ {1023}\n/);
+  assert.deepEqual(JSON.parse(text), song);
+});
+
+test("late provider failures and incomplete output stay errors after heartbeat headers", async t => {
+  t.mock.method(global, "setInterval", (fn, delay, ...args) =>
+    originalSetInterval(fn, delay === GENERATION_HEARTBEAT_MS ? 5 : delay, ...args));
+  for (const [index, payload] of [
+    { error: { message: "provider unavailable" }, ...song },
+    { choices: [{ finish_reason: "length", message: { content: "truncated" } }] },
+  ].entries()) {
+    const mock = t.mock.method(global, "fetch", async () => {
+      await new Promise(resolve => originalSetTimeout(resolve, 25));
+      return Response.json(payload, { status: index === 0 ? 503 : 200 });
+    });
+    const response = await post({ model: "anthropic/claude-opus-4.8",
+      messages: [{ role: "user", content: `late-error-${index}` }] });
+    assert.equal(response.status, 200, "HTTP status cannot change after heartbeat");
+    const data = await response.json();
+    assert.ok(data.error, "mobile decoders cannot mistake this for a song");
+    assert.equal(data.choices, undefined);
+    mock.mock.restore();
+  }
+});
+
+test("one timed-out generation suppresses immediate retries across models and JSON key order", async t => {
+  t.mock.method(global, "setInterval", (fn, delay, ...args) =>
+    originalSetInterval(fn, delay === GENERATION_HEARTBEAT_MS ? 5 : delay, ...args));
+  t.mock.method(global, "setTimeout", (fn, delay, ...args) =>
+    originalSetTimeout(fn, delay === GENERATION_TIMEOUT_MS ? 30 : delay, ...args));
+  const mock = t.mock.method(global, "fetch", async (url, { signal }) => ({
+    json: () => new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(Error("aborted")), { once: true })),
+  }));
+  const original = { model: "anthropic/claude-opus-4.8", temperature: 0.85,
+    messages: [{ role: "user", content: "retry-suppression-unique" }], response_format: { type: "json_object" } };
+  const timedOut = await post(original);
+  assert.equal((await timedOut.json()).code, "generation_timeout");
+  for (const model of ["anthropic/claude-opus-4.8", "anthropic/claude-sonnet-4.6", "deepseek/deepseek-v4-pro"]) {
+    const retried = await post({ response_format: { type: "json_object" },
+      messages: [{ content: "retry-suppression-unique", role: "user" }], temperature: 0.85, model });
+    assert.equal(retried.status, 429);
+    assert.ok(Number(retried.headers.get("retry-after")) > 0);
+    assert.equal((await retried.json()).code, "generation_retry_cooldown");
+  }
+  assert.equal(mock.mock.callCount(), 1, "fallback IDs must not launch more paid requests after timeout");
+  mock.mock.restore();
+  t.mock.method(global, "fetch", async () => Response.json(song));
+  const changed = await post({ ...original, messages: [{ role: "user", content: "a different song" }] });
+  assert.equal(changed.status, 200, "only the identical failed operation is cooled down");
+  await changed.json();
+  const future = Date.now() + 61000;
+  t.mock.method(Date, "now", () => future);
+  const afterCooldown = await post(original);
+  assert.equal(afterCooldown.status, 200);
+  await afterCooldown.json();
 });
