@@ -1,5 +1,6 @@
 const express = require("express");
 const { createHmac, randomBytes, randomUUID } = require("node:crypto");
+const { createLyricsHandler, isLyricsGeneration } = require("./lyrics-generation");
 const app = express();
 
 app.use(express.json());
@@ -236,6 +237,8 @@ app.get("/", (req, res) => {
 });
 
 // Proxy endpoint - iOS app calls this instead of OpenRouter directly
+const handleLyrics = createLyricsHandler({ apiKey: OPENROUTER_API_KEY,
+  prepareBody: prepareGenerationBody, blockRetry: blockImmediateRetry, sendJSON: sendGenerationJSON });
 app.post("/api/generate", async (req, res) => {
   if (!OPENROUTER_API_KEY) {
     return res.status(500).json({ error: "Server misconfiguration: missing API key." });
@@ -255,6 +258,8 @@ app.post("/api/generate", async (req, res) => {
       code: "generation_retry_cooldown", retry_after: retryAfter });
   }
   failedGenerations.delete(fingerprint);
+
+  if (isLyricsGeneration(req.body)) return handleLyrics(req, res, fingerprint);
 
   const outboundBody = prepareGenerationBody(req.body);
   const requestId = randomUUID();
