@@ -1,10 +1,8 @@
 const { randomUUID } = require("node:crypto");
 
 // The shipped iOS lyrics request has a 75s idle deadline. Keep the entire
-// operation (including fallback) below it, without committing HTTP 200 early.
+// single attempt below it, without committing HTTP 200 early.
 const LYRICS_TOTAL_MS = 70_000;
-const LYRICS_PRIMARY_MS = 45_000;
-const LYRICS_FALLBACK_MS = 25_000;
 
 function isLyricsGeneration(body) {
   // Recognize the existing app contract; no app update or client tier claim is
@@ -74,8 +72,8 @@ function createLyricsHandler({ apiKey, prepareBody, blockRetry, sendJSON }) {
     const elapsed = () => Math.round(performance.now() - started);
     const requested = req.body.model;
     const proRoute = requested === "anthropic/claude-opus-4.8";
-    const models = proRoute ? [requested, "anthropic/claude-sonnet-4.6"] : [requested];
-    let model = prepareBody(req.body).model;
+    const body = prepareBody(req.body);
+    const model = body.model;
     let attempts = 0;
     // Route is inferred from the requested model, NOT a verified subscription.
     const context = () => `id=${requestId} requested=${requested} model=${model} kind=lyrics tier=unknown route=${proRoute ? "pro_primary" : "other"} attempts=${attempts}`;
@@ -87,49 +85,30 @@ function createLyricsHandler({ apiKey, prepareBody, blockRetry, sendJSON }) {
     const totalTimer = setTimeout(() => controller.abort(new GenerationTimeout("Operation timed out")), LYRICS_TOTAL_MS);
     console.log(`[generate] start ${context()}`);
     try {
-      for (const [index, requestedModel] of models.entries()) {
-        if (controller.signal.aborted) throw controller.signal.reason;
-        const body = prepareBody({ ...req.body, model: requestedModel });
-        model = body.model;
-        attempts++;
-        const limit = proRoute ? (index === 0 ? LYRICS_PRIMARY_MS : LYRICS_FALLBACK_MS) : LYRICS_TOTAL_MS;
-        let result;
-        try {
-          result = await attempt(body, limit, controller.signal, apiKey);
-        } catch (error) {
-          if (error instanceof GenerationTimeout && index === 0 && proRoute && !controller.signal.aborted) {
-            console.warn(`[generate_attempt] timeout ${context()} elapsed_ms=${elapsed()} fallback=anthropic/claude-sonnet-4.6`);
-            continue;
-          }
-          throw error;
+      if (controller.signal.aborted) throw controller.signal.reason;
+      attempts++;
+      const { response, data } = await attempt(body, LYRICS_TOTAL_MS, controller.signal, apiKey);
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (!response.ok) {
+        // A provider/CDN timeout gets the same terminal JSON contract as our
+        // own deadline. Never return an HTML 524 or an ambiguous HTTP 200.
+        if ([408, 504, 524].includes(response.status)) {
+          throw new GenerationTimeout("Upstream timed out");
         }
-        const { response, data } = result;
-        if (controller.signal.aborted) throw controller.signal.reason;
-        if (!response.ok) {
-          // A provider/CDN timeout gets the same terminal JSON contract as our
-          // own deadline. Never return an HTML 524 or an ambiguous HTTP 200.
-          if ([408, 504, 524].includes(response.status)) {
-            if (index === 0 && proRoute) {
-              console.warn(`[generate_attempt] timeout ${context()} status=${response.status} elapsed_ms=${elapsed()} fallback=anthropic/claude-sonnet-4.6`);
-              continue;
-            }
-            throw new GenerationTimeout("Upstream timed out");
-          }
-          console.warn(`[generate] upstream_error ${context()} status=${response.status} elapsed_ms=${elapsed()}`);
-          return sendJSON(res, response.status, { error: data?.error || "AI provider request failed.", code: "generation_failed" });
-        }
-        const choice = data?.choices?.[0];
-        if (data?.error || !choice?.message?.content || choice.finish_reason === "length") {
-          console.warn(`[generate] incomplete ${context()} elapsed_ms=${elapsed()}`);
-          return sendJSON(res, 502, { error: "AI returned an incomplete response. Please try again.", code: "generation_incomplete" });
-        }
-        const usage = data?.usage;
-        if (usage?.prompt_tokens_details) {
-          console.log(`[cache] ${model} prompt=${usage.prompt_tokens} cached=${usage.prompt_tokens_details.cached_tokens || 0} written=${usage.prompt_tokens_details.cache_write_tokens || 0} cost=${usage.cost ?? "?"}`);
-        }
-        console.log(`[generate] complete ${context()} elapsed_ms=${elapsed()} reasoning_tokens=${usage?.completion_tokens_details?.reasoning_tokens ?? 0}`);
-        return sendJSON(res, 200, data);
+        console.warn(`[generate] upstream_error ${context()} status=${response.status} elapsed_ms=${elapsed()}`);
+        return sendJSON(res, response.status, { error: data?.error || "AI provider request failed.", code: "generation_failed" });
       }
+      const choice = data?.choices?.[0];
+      if (data?.error || !choice?.message?.content || choice.finish_reason === "length") {
+        console.warn(`[generate] incomplete ${context()} elapsed_ms=${elapsed()}`);
+        return sendJSON(res, 502, { error: "AI returned an incomplete response. Please try again.", code: "generation_incomplete" });
+      }
+      const usage = data?.usage;
+      if (usage?.prompt_tokens_details) {
+        console.log(`[cache] ${model} prompt=${usage.prompt_tokens} cached=${usage.prompt_tokens_details.cached_tokens || 0} written=${usage.prompt_tokens_details.cache_write_tokens || 0} cost=${usage.cost ?? "?"}`);
+      }
+      console.log(`[generate] complete ${context()} elapsed_ms=${elapsed()} reasoning_tokens=${usage?.completion_tokens_details?.reasoning_tokens ?? 0}`);
+      return sendJSON(res, 200, data);
     } catch (error) {
       if (error instanceof GenerationTimeout || error instanceof ClientDisconnected) {
         if (active.get(fingerprint) === lease) blockRetry(fingerprint);
@@ -146,4 +125,4 @@ function createLyricsHandler({ apiKey, prepareBody, blockRetry, sendJSON }) {
   };
 }
 
-module.exports = { createLyricsHandler, isLyricsGeneration, LYRICS_TOTAL_MS, LYRICS_PRIMARY_MS, LYRICS_FALLBACK_MS };
+module.exports = { createLyricsHandler, isLyricsGeneration, LYRICS_TOTAL_MS };
