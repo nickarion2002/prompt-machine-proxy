@@ -1,6 +1,7 @@
 const express = require("express");
 const { createHmac, randomBytes, randomUUID } = require("node:crypto");
 const { createLyricsHandler, isLyricsGeneration } = require("./lyrics-generation");
+const { createYouTubeMetadata } = require("./youtube-metadata");
 const app = express();
 
 app.use(express.json());
@@ -10,6 +11,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
 let spotifyAccessToken = null;
 let spotifyTokenExpiresAt = 0;
@@ -71,6 +73,9 @@ function rateLimit(req, res, next) {
 }
 
 app.use(["/api/generate", "/api/spotify/genre", "/api/spotify/track-features"], rateLimit, checkAppKey);
+
+const youtube = createYouTubeMetadata({ apiKey: YOUTUBE_API_KEY, clientIp });
+app.get("/api/youtube/:videoId", youtube.rateLimit, checkAppKey, youtube.handleMetadata);
 
 // ─── Model ID remapping ───────────────────────────────────────────────────────
 // OpenRouter periodically deprecates model IDs. We remap old IDs to current
