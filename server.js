@@ -90,10 +90,6 @@ const MODEL_REMAP = {
   "deepseek/deepseek-chat":       "deepseek/deepseek-v4-flash",
   "deepseek/deepseek-chat-v3.1":  "deepseek/deepseek-v4-flash",
   // Keep Sonnet 4.6 distinct: shipped PRO clients use it after Opus 4.8 fails.
-  // Opus 4.8 → Sonnet 5 (cost control, 10 sept 2026: $5/$25 → $2/$10, ~60%
-  // cheaper per PRO lyrics generation; Sonnet 5 quality validated in prod
-  // since July via the 4.6 remap). Revert = delete this line.
-  "anthropic/claude-opus-4.8":    "anthropic/claude-sonnet-5",
   "mistralai/mistral-small-3.1":  "mistralai/mistral-small-3.2-24b-instruct-2506",
 };
 
@@ -103,11 +99,11 @@ function remapModel(modelId) {
 
 // Mobile callers have 60–75s idle timeouts and expect one complete JSON response. Sonnet 5
 // enables high-effort thinking by default; in production this spent >180s on
-// reasoning while the phone retried. Retain the model but disable extended
-// thinking for this synchronous endpoint and leave room for both song variants.
+// reasoning while the phone retried. Keep those synchronous bounds for PRO
+// Opus too, while serving the model the caller requests.
 function prepareGenerationBody(body) {
   const prepared = { ...body, model: remapModel(body.model), stream: false };
-  if (["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6"].includes(prepared.model)) {
+  if (["anthropic/claude-opus-4.8", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6"].includes(prepared.model)) {
     delete prepared.reasoning_effort;
     delete prepared.include_reasoning;
     delete prepared.max_completion_tokens;
@@ -119,8 +115,10 @@ function prepareGenerationBody(body) {
     // Prefer throughput without opting into a more expensive service tier.
     // Preserve client privacy/provider restrictions and any tighter price caps.
     const provider = body.provider || {};
-    const prices = prepared.model === "anthropic/claude-sonnet-5"
-      ? { prompt: 2, completion: 10 } : { prompt: 3, completion: 15 };
+    const prices = prepared.model === "anthropic/claude-opus-4.8"
+      ? { prompt: 5, completion: 25 }
+      : prepared.model === "anthropic/claude-sonnet-5"
+        ? { prompt: 2, completion: 10 } : { prompt: 3, completion: 15 };
     const maxPrice = { ...provider.max_price };
     for (const [kind, cap] of Object.entries(prices)) {
       const requested = Number(maxPrice[kind]);
