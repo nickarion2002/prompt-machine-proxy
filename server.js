@@ -89,7 +89,10 @@ const MODEL_REMAP = {
   // Old DeepSeek IDs → DeepSeek V4 Flash (2-3x cheaper, better quality)
   "deepseek/deepseek-chat":       "deepseek/deepseek-v4-flash",
   "deepseek/deepseek-chat-v3.1":  "deepseek/deepseek-v4-flash",
-  // Keep Sonnet 4.6 distinct: shipped PRO clients use it after Opus 4.8 fails.
+  // PRO Opus 4.8 → Opus 5.5 (29 Oct 2026): in a blind Romanian test it made half the language
+  // errors, wrote a song in 31–45 s instead of 47–68 s (the lyrics cap is 70 s) and costs
+  // $4/$20 instead of $5/$25. Keep Sonnet 4.6 distinct: shipped PRO clients use it after Opus fails.
+  "anthropic/claude-opus-4.8":    "anthropic/claude-opus-5.5",
   "mistralai/mistral-small-3.1":  "mistralai/mistral-small-3.2-24b-instruct-2506",
 };
 
@@ -100,14 +103,15 @@ function remapModel(modelId) {
 // Mobile callers have 60–75s idle timeouts and expect one complete JSON response. Sonnet 5
 // enables high-effort thinking by default; in production this spent >180s on
 // reasoning while the phone retried. Keep those synchronous bounds for PRO
-// Opus too, while serving the model the caller requests.
+// Opus too, while serving the model the caller requests. Opus 5.5 refuses to run
+// without reasoning (HTTP 400 "Reasoning is mandatory"), so it gets the lowest effort.
 function prepareGenerationBody(body) {
   const prepared = { ...body, model: remapModel(body.model), stream: false };
-  if (["anthropic/claude-opus-4.8", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6"].includes(prepared.model)) {
+  if (["anthropic/claude-opus-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4.6"].includes(prepared.model)) {
     delete prepared.reasoning_effort;
     delete prepared.include_reasoning;
     delete prepared.max_completion_tokens;
-    prepared.reasoning = { enabled: false };
+    prepared.reasoning = prepared.model === "anthropic/claude-opus-5.5" ? { effort: "low" } : { enabled: false };
     const requestedLimit = body.max_completion_tokens ?? body.max_tokens;
     prepared.max_tokens = Number.isInteger(requestedLimit) && requestedLimit > 0
       ? Math.min(requestedLimit, 8192)
@@ -115,8 +119,8 @@ function prepareGenerationBody(body) {
     // Prefer throughput without opting into a more expensive service tier.
     // Preserve client privacy/provider restrictions and any tighter price caps.
     const provider = body.provider || {};
-    const prices = prepared.model === "anthropic/claude-opus-4.8"
-      ? { prompt: 5, completion: 25 }
+    const prices = prepared.model === "anthropic/claude-opus-5.5"
+      ? { prompt: 4, completion: 20 }
       : prepared.model === "anthropic/claude-sonnet-5"
         ? { prompt: 2, completion: 10 } : { prompt: 3, completion: 15 };
     const maxPrice = { ...provider.max_price };

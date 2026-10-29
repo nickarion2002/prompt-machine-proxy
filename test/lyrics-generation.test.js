@@ -41,7 +41,7 @@ test("shipped lyrics contract is recognized without misclassifying YouTube analy
 });
 test("successful lyrics serve requested Opus and do not invoke fallback", async t => {
   const mock = t.mock.method(global, "fetch", async (url, options) => {
-    assert.equal(JSON.parse(options.body).model, "anthropic/claude-opus-4.8");
+    assert.equal(JSON.parse(options.body).model, "anthropic/claude-opus-5.5");
     return Response.json(song);
   });
   const r = await post(body("successful generation"));
@@ -63,7 +63,8 @@ test("PRO primary can finish after the old 45s cutoff without fallback; restrict
   });
   const r = await post(payload);
   assert.equal(r.status, 200); assert.deepEqual(await r.json(), song);
-  assert.deepEqual(seen.map(x => x.model), ["anthropic/claude-opus-4.8"]);
+  assert.deepEqual(seen.map(x => x.model), ["anthropic/claude-opus-5.5"]);
+  assert.deepEqual(seen[0].reasoning, { effort: "low" });
   assert.deepEqual(seen[0].messages, payload.messages);
   assert.deepEqual(seen[0].provider.max_price, payload.provider.max_price);
   assert.deepEqual(seen[0].provider.only, ["anthropic"]);

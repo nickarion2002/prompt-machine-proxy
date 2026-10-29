@@ -37,8 +37,8 @@ test("PRO serves requested Opus with bounded reasoning; fallback remains a diffe
   const input = { model: "anthropic/claude-opus-4.8", messages, stream: true,
     reasoning: { effort: "high" }, reasoning_effort: "high", include_reasoning: true };
   const primary = prepareGenerationBody(input);
-  assert.equal(primary.model, "anthropic/claude-opus-4.8");
-  assert.deepEqual(primary.reasoning, { enabled: false });
+  assert.equal(primary.model, "anthropic/claude-opus-5.5", "PRO Opus 4.8 is served by Opus 5.5");
+  assert.deepEqual(primary.reasoning, { effort: "low" }, "Opus 5.5 rejects reasoning off");
   assert.equal(primary.reasoning_effort, undefined);
   assert.equal(primary.include_reasoning, undefined);
   assert.equal(primary.stream, false);
@@ -62,7 +62,7 @@ test("output budget respects smaller limits and normalizes the alternate token p
 test("throughput routing never opts into higher prices or discards client restrictions", () => {
   const primary = prepareGenerationBody({ model: "anthropic/claude-opus-4.8", messages });
   assert.equal(primary.provider.sort, "throughput");
-  assert.deepEqual(primary.provider.max_price, { prompt: 5, completion: 25 });
+  assert.deepEqual(primary.provider.max_price, { prompt: 4, completion: 20 });
   const sonnet = prepareGenerationBody({ model: "anthropic/claude-sonnet-5", messages });
   assert.equal(sonnet.model, "anthropic/claude-sonnet-5");
   assert.deepEqual(sonnet.provider.max_price, { prompt: 2, completion: 10 });
@@ -110,8 +110,8 @@ test("production route forwards bounded policy and preserves the response contra
     assert.equal(url, "https://openrouter.ai/api/v1/chat/completions");
     assert.equal(options.headers.Authorization, "Bearer unit-test-only");
     const body = JSON.parse(options.body);
-    assert.equal(body.model, "anthropic/claude-opus-4.8");
-    assert.deepEqual(body.reasoning, { enabled: false });
+    assert.equal(body.model, "anthropic/claude-opus-5.5");
+    assert.deepEqual(body.reasoning, { effort: "low" });
     upstreamSignal = options.signal;
     assert.equal(upstreamSignal.aborted, false);
     return Response.json(song);
