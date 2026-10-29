@@ -73,6 +73,23 @@ test("throughput routing never opts into higher prices or discards client restri
   assert.equal(restricted.max_price.completion, 100, "do not mutate caller constraints");
 });
 
+test("DeepSeek V4 answers without reasoning; its routing and limits stay the client's", () => {
+  for (const model of ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro", "deepseek/deepseek-chat"]) {
+    const input = { model, messages, temperature: 0.85, response_format: { type: "json_object" },
+      reasoning: { effort: "high" }, reasoning_effort: "high", include_reasoning: true };
+    const prepared = prepareGenerationBody(input);
+    assert.deepEqual(prepared.reasoning, { enabled: false });
+    assert.equal(prepared.reasoning_effort, undefined);
+    assert.equal(prepared.include_reasoning, undefined);
+    assert.equal(prepared.max_tokens, undefined);
+    assert.equal(prepared.provider, undefined);
+    assert.equal(prepared.temperature, 0.85);
+    assert.deepEqual(prepared.response_format, { type: "json_object" });
+    assert.equal(input.reasoning.effort, "high", "do not mutate the client's body");
+  }
+  assert.equal(prepareGenerationBody({ model: "deepseek/deepseek-chat", messages }).model, "deepseek/deepseek-v4-flash");
+});
+
 test("preserve non-Sonnet model settings and existing prompt cache breakpoints", () => {
   const free = prepareGenerationBody({ model: "google/gemini-2.5-flash", messages, reasoning: { effort: "low" } });
   assert.equal(free.model, "google/gemini-3.1-flash-lite");

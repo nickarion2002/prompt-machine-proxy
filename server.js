@@ -127,6 +127,15 @@ function prepareGenerationBody(body) {
     }
     prepared.provider = { ...provider, sort: provider.sort || "throughput", max_price: maxPrice };
   }
+  // DeepSeek V4 reasons by default: about 7,000 reasoning tokens and 47–55 s for one song,
+  // past the 70 s lyrics cap once the prompt grew (29 Oct 2026). Without reasoning the same
+  // songs came back in 10–13 s and passed the app's strict structure check. Only reasoning
+  // changes; routing, prices and token limits stay the client's.
+  if (["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"].includes(prepared.model)) {
+    delete prepared.reasoning_effort;
+    delete prepared.include_reasoning;
+    prepared.reasoning = { enabled: false };
+  }
   return addAnthropicCacheControl(prepared);
 }
 
